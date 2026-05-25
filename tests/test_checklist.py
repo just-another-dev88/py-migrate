@@ -131,4 +131,79 @@ def test_row_count_match():
         "target_query": "SELECT COUNT(*) FROM tgt"
     })
     assert res.passed is False
-    assert "Source rows: 42, Target rows: 30" in res.message
+    assert "Aggregate Source rows: 42, Target rows: 30" in res.message
+
+
+def test_checklist_multi_source():
+    # Setup two source shard adapters
+    src1 = MockDatabaseAdapter()
+    src2 = MockDatabaseAdapter()
+    tgt = MockDatabaseAdapter()
+    
+    runner = ChecklistRunner([src1, src2], tgt)
+
+    # 1. Test sql_exists on multi-source (passes only if both contain data)
+    src1.mock_fetch_results = [{"1": 1}]
+    src2.mock_fetch_results = [{"1": 1}]
+    res = runner.run_check({
+        "name": "Check shard tables",
+        "type": "sql_exists",
+        "database": "source",
+        "query": "SELECT 1"
+    })
+    assert res.passed is True
+
+    # Test sql_exists fail on one shard
+    src2.mock_fetch_results = []
+    res = runner.run_check({
+        "name": "Check shard tables",
+        "type": "sql_exists",
+        "database": "source",
+        "query": "SELECT 1"
+    })
+    assert res.passed is False
+    assert "source[1] (0 rows)" in res.message
+
+    # 2. Test sql_count aggregates (sums) counts across both shards
+    src1.mock_fetch_results = [{"COUNT": 30}]
+    src2.mock_fetch_results = [{"COUNT": 20}]
+    res = runner.run_check({
+        "name": "Aggregated count",
+        "type": "sql_count",
+        "database": "source",
+        "query": "SELECT COUNT(*)",
+        "expected": "== 50"
+    })
+    assert res.passed is True
+
+    # Aggregated count comparison operator
+    res = runner.run_check({
+        "name": "Aggregated count",
+        "type": "sql_count",
+        "database": "source",
+        "query": "SELECT COUNT(*)",
+        "expected": ">= 45"
+    })
+    assert res.passed is True
+
+    # Aggregated count failing comparison
+    res = runner.run_check({
+        "name": "Aggregated count",
+        "type": "sql_count",
+        "database": "source",
+        "query": "SELECT COUNT(*)",
+        "expected": "== 100"
+    })
+    assert res.passed is False
+    assert "Expected: == 100, Got: 50" in res.message
+
+    # 3. Test row_count_match sums all sources
+    tgt.mock_fetch_results = [{"COUNT": 50}]
+    res = runner.run_check({
+        "name": "Match target with aggregate sources",
+        "type": "row_count_match",
+        "source_query": "SELECT COUNT(*) FROM src",
+        "target_query": "SELECT COUNT(*) FROM tgt"
+    })
+    assert res.passed is True
+

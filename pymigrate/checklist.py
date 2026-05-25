@@ -22,8 +22,13 @@ class CheckResult:
 class ChecklistRunner:
     """Executes pre-migration and post-migration assertions against database adapters."""
 
-    def __init__(self, source_db: BaseDatabaseAdapter, target_db: BaseDatabaseAdapter):
-        self.source_db = source_db
+    def __init__(self, source_dbs: Any, target_db: BaseDatabaseAdapter):
+        if isinstance(source_dbs, list):
+            self.source_dbs = source_dbs
+        else:
+            self.source_dbs = [source_dbs]
+        # Keep a self.source_db pointing to the first source for backward compatibility
+        self.source_db = self.source_dbs[0] if self.source_dbs else None
         self.target_db = target_db
 
     def _get_db(self, db_ref: str) -> BaseDatabaseAdapter:
@@ -78,12 +83,32 @@ class ChecklistRunner:
         if not query:
             return CheckResult(name, "sql_exists", False, "Missing SQL 'query' in config.")
             
-        db = self._get_db(db_ref)
-        results = db.fetch_all(query)
-        
-        passed = len(results) > 0
-        message = "" if passed else "Query returned 0 rows (expected >= 1 row)."
-        return CheckResult(name, "sql_exists", passed, message)
+        if db_ref and db_ref.lower() == "source":
+            failures = []
+            for idx, db in enumerate(self.source_dbs):
+                try:
+                    results = db.fetch_all(query)
+                    if len(results) == 0:
+                        failures.append(f"source[{idx}] (0 rows)")
+                except Exception as e:
+                    failures.append(f"source[{idx}] failed: {e}")
+            passed = len(failures) == 0
+            if passed:
+                message = ""
+            else:
+                if len(self.source_dbs) == 1:
+                    message = "Query returned 0 rows (expected >= 1 row)."
+                    if "failed" in failures[0]:
+                        message = failures[0]
+                else:
+                    message = f"SQL existence check failed on: {', '.join(failures)}"
+            return CheckResult(name, "sql_exists", passed, message)
+        else:
+            db = self._get_db(db_ref)
+            results = db.fetch_all(query)
+            passed = len(results) > 0
+            message = "" if passed else "Query returned 0 rows (expected >= 1 row)."
+            return CheckResult(name, "sql_exists", passed, message)
 
     def _run_sql_count(self, name: str, config: Dict[str, Any]) -> CheckResult:
         db_ref = config.get("database")
@@ -95,20 +120,29 @@ class ChecklistRunner:
         if expected_val is None:
             return CheckResult(name, "sql_count", False, "Missing 'expected' value in config.")
 
-        db = self._get_db(db_ref)
-        results = db.fetch_all(query)
-        
-        if not results:
-            return CheckResult(name, "sql_count", False, "Query returned no rows to count.")
-            
-        # Extract first value from the first row of result set
-        first_row = results[0]
-        actual_val = list(first_row.values())[0]
-        
-        try:
-            actual_val = int(actual_val)
-        except (ValueError, TypeError):
-            return CheckResult(name, "sql_count", False, f"Returned count is not an integer: {actual_val}")
+        actual_val = 0
+        if db_ref and db_ref.lower() == "source":
+            for idx, db in enumerate(self.source_dbs):
+                results = db.fetch_all(query)
+                if not results:
+                    return CheckResult(name, "sql_count", False, f"Query returned no rows on source[{idx}].")
+                first_row = results[0]
+                val = list(first_row.values())[0]
+                try:
+                    actual_val += int(val)
+                except (ValueError, TypeError):
+                    return CheckResult(name, "sql_count", False, f"Returned count is not an integer on source[{idx}]: {val}")
+        else:
+            db = self._get_db(db_ref)
+            results = db.fetch_all(query)
+            if not results:
+                return CheckResult(name, "sql_count", False, "Query returned no rows to count.")
+            first_row = results[0]
+            val = list(first_row.values())[0]
+            try:
+                actual_val = int(val)
+            except (ValueError, TypeError):
+                return CheckResult(name, "sql_count", False, f"Returned count is not an integer: {val}")
             
         # Parse comparison expression (e.g. expected: ">= 5" or just integer expected: 0)
         passed = False
@@ -163,22 +197,25 @@ class ChecklistRunner:
         if not tgt_query:
             return CheckResult(name, "row_count_match", False, "Missing 'target_query' in config.")
 
-        src_res = self.source_db.fetch_all(src_query)
+        # Aggregate row counts across all sources
+        src_count = 0
+        for idx, db in enumerate(self.source_dbs):
+            src_res = db.fetch_all(src_query)
+            if src_res:
+                try:
+                    src_count += int(list(src_res[0].values())[0])
+                except Exception as e:
+                    return CheckResult(name, "row_count_match", False, f"Error getting count from source[{idx}]: {e}")
+
+        # Get count from target database
         tgt_res = self.target_db.fetch_all(tgt_query)
-        
-        if not src_res or not tgt_res:
-            src_count = 0 if not src_res else int(list(src_res[0].values())[0])
-            tgt_count = 0 if not tgt_res else int(list(tgt_res[0].values())[0])
-        else:
-            try:
-                src_count = int(list(src_res[0].values())[0])
-            except Exception:
-                src_count = 0
+        tgt_count = 0
+        if tgt_res:
             try:
                 tgt_count = int(list(tgt_res[0].values())[0])
-            except Exception:
-                tgt_count = 0
+            except Exception as e:
+                return CheckResult(name, "row_count_match", False, f"Error getting count from target: {e}")
 
         passed = src_count == tgt_count
-        message = "" if passed else f"Source rows: {src_count}, Target rows: {tgt_count}"
+        message = "" if passed else f"Aggregate Source rows: {src_count}, Target rows: {tgt_count}"
         return CheckResult(name, "row_count_match", passed, message)

@@ -22,7 +22,7 @@ class TrackingDatabaseAdapter(MockDatabaseAdapter):
         return len(rows)
 
 
-def get_test_template_path(pre_checks=None, post_checks=None):
+def get_test_template_path(pre_checks=None, post_checks=None, multi_source=False):
     pre_yaml = ""
     if pre_checks:
         pre_yaml = "pre_migration:\n" + "\n".join([f"  - name: {c['name']}\n    type: {c['type']}\n    database: {c['database']}\n    query: '{c['query']}'" for c in pre_checks])
@@ -31,9 +31,11 @@ def get_test_template_path(pre_checks=None, post_checks=None):
     if post_checks:
         post_yaml = "post_migration:\n" + "\n".join([f"  - name: {c['name']}\n    type: {c['type']}\n    database: {c['database']}\n    query: '{c['query']}'\n    expected: {c['expected']}" for c in post_checks])
 
+    source_db_block = 'source_db:\n  - "src1"\n  - "src2"' if multi_source else 'source_db: "src"'
+
     yaml_content = f"""
 name: "test_migration"
-source_db: "src"
+{source_db_block}
 target_db: "tgt"
 streaming:
   chunk_size: 2
@@ -173,6 +175,95 @@ def test_migration_engine_rollback_on_post_check_failure():
         assert "Post-migration checklist failed" in str(exc_info.value)
         
         # Verify transaction rolled back even though streaming/writing succeeded
+        assert tgt_db.begin_called is True
+        assert tgt_db.commit_called is False
+        assert tgt_db.rollback_called is True
+        
+    finally:
+        os.remove(template_path)
+
+
+def test_migration_engine_multi_source_success():
+    template_path = get_test_template_path(multi_source=True)
+    try:
+        template = MigrationTemplate(template_path)
+        db_configs = {"src1": {"type": "postgres"}, "src2": {"type": "postgres"}, "tgt": {"type": "postgres"}}
+        
+        engine = MigrationEngine(template, db_configs)
+        engine._init_databases()
+        
+        src_db1 = TrackingDatabaseAdapter()
+        src_db2 = TrackingDatabaseAdapter()
+        tgt_db = TrackingDatabaseAdapter()
+        
+        engine.source_dbs = [src_db1, src_db2]
+        engine.source_db = src_db1
+        engine.target_db = tgt_db
+
+        # Source 1 data
+        src_db1.stream_data = [
+            [{"ID": 1, "NAME": "ALICE"}, {"ID": 2, "NAME": "BOB"}]
+        ]
+        # Source 2 data
+        src_db2.stream_data = [
+            [{"ID": 3, "NAME": "CHARLIE"}]
+        ]
+        
+        res = engine.run()
+        
+        assert res["success"] is True
+        assert res["rows_migrated"] == 3
+        
+        # Verify transaction boundary on single target
+        assert tgt_db.begin_called is True
+        assert tgt_db.commit_called is True
+        assert tgt_db.rollback_called is False
+        
+        # Verify written data has batches from both databases sequentially
+        assert len(tgt_db.written_batches) == 2
+        
+        batch1 = tgt_db.written_batches[0]
+        assert batch1[2] == [(1, "alice"), (2, "bob")]
+        
+        batch2 = tgt_db.written_batches[1]
+        assert batch2[2] == [(3, "charlie")]
+        
+    finally:
+        os.remove(template_path)
+
+
+def test_migration_engine_multi_source_failure_rollback():
+    template_path = get_test_template_path(multi_source=True)
+    try:
+        template = MigrationTemplate(template_path)
+        db_configs = {"src1": {"type": "postgres"}, "src2": {"type": "postgres"}, "tgt": {"type": "postgres"}}
+        
+        engine = MigrationEngine(template, db_configs)
+        engine._init_databases()
+        
+        src_db1 = TrackingDatabaseAdapter()
+        src_db2 = TrackingDatabaseAdapter()
+        tgt_db = TrackingDatabaseAdapter()
+        
+        engine.source_dbs = [src_db1, src_db2]
+        engine.source_db = src_db1
+        engine.target_db = tgt_db
+
+        # Shard 1 succeeded
+        src_db1.stream_data = [
+            [{"ID": 1, "NAME": "ALICE"}]
+        ]
+        # Shard 2 fails due to mapping transform value type error
+        src_db2.stream_data = [
+            [{"ID": "NOT_AN_INT", "NAME": "BOB"}]
+        ]
+        
+        with pytest.raises(MigrationError) as exc_info:
+            engine.run()
+            
+        assert "Transformation failed" in str(exc_info.value)
+        
+        # Verify single target rolled back entirely, throwing away Shard 1 and Shard 2 writes
         assert tgt_db.begin_called is True
         assert tgt_db.commit_called is False
         assert tgt_db.rollback_called is True

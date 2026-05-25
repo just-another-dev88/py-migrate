@@ -17,36 +17,46 @@ class MigrationEngine:
     def __init__(self, template: MigrationTemplate, db_configs: Dict[str, Any]):
         self.template = template
         self.db_configs = db_configs
+        self.source_dbs: List[BaseDatabaseAdapter] = []
         self.source_db: BaseDatabaseAdapter = None
         self.target_db: BaseDatabaseAdapter = None
 
     def _init_databases(self) -> None:
         """Initialize the database adapters based on the template config."""
-        if self.source_db is not None and self.target_db is not None:
+        # Sync list and single reference if mock instances were injected during testing
+        if self.source_db is not None and (not self.source_dbs or self.source_dbs[0] is not self.source_db):
+            self.source_dbs = [self.source_db]
+        elif self.source_dbs and self.source_db is None:
+            self.source_db = self.source_dbs[0]
+
+        if self.source_dbs and self.target_db is not None:
             logger.debug("Databases already initialized (or injected). Skipping setup.")
             return
 
-        src_name = self.template.source_db
+        src_names = self.template.source_dbs
         tgt_name = self.template.target_db
 
-        if src_name not in self.db_configs:
-            raise MigrationError(f"Source database configuration '{src_name}' not found in db_config.")
+        for name in src_names:
+            if name not in self.db_configs:
+                raise MigrationError(f"Source database configuration '{name}' not found in db_config.")
         if tgt_name not in self.db_configs:
             raise MigrationError(f"Target database configuration '{tgt_name}' not found in db_config.")
 
         try:
-            self.source_db = get_adapter(self.db_configs[src_name])
+            self.source_dbs = [get_adapter(self.db_configs[name]) for name in src_names]
+            self.source_db = self.source_dbs[0] if self.source_dbs else None
             self.target_db = get_adapter(self.db_configs[tgt_name])
         except Exception as e:
             raise MigrationError(f"Failed to initialize database adapters: {e}")
 
     def _close_databases(self) -> None:
         """Gracefully close all database connections."""
-        if self.source_db:
-            try:
-                self.source_db.close()
-            except Exception as e:
-                logger.warning(f"Error closing source database: {e}")
+        if self.source_dbs:
+            for db in self.source_dbs:
+                try:
+                    db.close()
+                except Exception as e:
+                    logger.warning(f"Error closing source database: {e}")
         if self.target_db:
             try:
                 self.target_db.close()
@@ -64,7 +74,7 @@ class MigrationEngine:
         try:
             # 1. Run Pre-Migration Checklist
             logger.info("Executing Pre-Migration Checklist...")
-            runner = ChecklistRunner(self.source_db, self.target_db)
+            runner = ChecklistRunner(self.source_dbs, self.target_db)
             pre_passed, pre_results = runner.run_checklist(self.template.pre_migration)
             
             for res in pre_results:
@@ -78,39 +88,40 @@ class MigrationEngine:
             self.target_db.begin_transaction()
             
             # 3. Stream & Map & Write
-            logger.info(f"Streaming data from source query. Chunk size: {self.template.chunk_size}")
             target_table = self.template.target_table
             target_columns = [col.target for col in self.template.columns]
             
-            stream = self.source_db.fetch_stream(
-                self.template.source_query, 
-                chunk_size=self.template.chunk_size
-            )
-            
             chunk_count = 0
-            for chunk in stream:
-                chunk_count += 1
-                logger.debug(f"Processing chunk {chunk_count} ({len(chunk)} rows)...")
+            for src_idx, src_db in enumerate(self.source_dbs):
+                logger.info(f"Streaming data from source [{src_idx}]... Chunk size: {self.template.chunk_size}")
+                stream = src_db.fetch_stream(
+                    self.template.source_query, 
+                    chunk_size=self.template.chunk_size
+                )
                 
-                rows_to_insert: List[Tuple] = []
-                for row_idx, row in enumerate(chunk):
+                for chunk in stream:
+                    chunk_count += 1
+                    logger.debug(f"Processing chunk {chunk_count} from source [{src_idx}] ({len(chunk)} rows)...")
+                    
+                    rows_to_insert: List[Tuple] = []
+                    for row_idx, row in enumerate(chunk):
+                        try:
+                            # Extract and transform columns
+                            mapped_values = []
+                            for col in self.template.columns:
+                                mapped_values.append(col.map_row(row))
+                            rows_to_insert.append(tuple(mapped_values))
+                        except Exception as e:
+                            raise MigrationError(
+                                f"Transformation failed at source [{src_idx}], chunk {chunk_count}, row index {row_idx}: {e}"
+                            )
+                    
+                    # Write batch to target
                     try:
-                        # Extract and transform columns
-                        mapped_values = []
-                        for col in self.template.columns:
-                            mapped_values.append(col.map_row(row))
-                        rows_to_insert.append(tuple(mapped_values))
+                        self.target_db.write_batch(target_table, target_columns, rows_to_insert)
+                        total_rows_migrated += len(rows_to_insert)
                     except Exception as e:
-                        raise MigrationError(
-                            f"Transformation failed at chunk {chunk_count}, row index {row_idx}: {e}"
-                        )
-                
-                # Write batch to target
-                try:
-                    self.target_db.write_batch(target_table, target_columns, rows_to_insert)
-                    total_rows_migrated += len(rows_to_insert)
-                except Exception as e:
-                    raise MigrationError(f"Database write failed at chunk {chunk_count}: {e}")
+                        raise MigrationError(f"Database write failed at source [{src_idx}], chunk {chunk_count}: {e}")
 
             logger.info(f"Stream migration complete. Total rows processed and written: {total_rows_migrated}")
             
@@ -159,12 +170,14 @@ class MigrationEngine:
         self._init_databases()
         try:
             logger.info("Validating database connections...")
-            self.source_db.connect()
+            for idx, db in enumerate(self.source_dbs):
+                db.connect()
+                logger.info(f"Source [{idx}] connection validated.")
             self.target_db.connect()
-            logger.info("Connections validated successfully.")
+            logger.info("Target connection validated successfully.")
             
             logger.info("Running Pre-Migration Checks (Dry-run)...")
-            runner = ChecklistRunner(self.source_db, self.target_db)
+            runner = ChecklistRunner(self.source_dbs, self.target_db)
             pre_passed, pre_results = runner.run_checklist(self.template.pre_migration)
             
             return {

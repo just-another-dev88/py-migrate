@@ -136,7 +136,15 @@ class MigrationTemplate:
         self.config = self._load_yaml(filepath)
         self.name = self.config.get("name")
         self.description = self.config.get("description", "")
-        self.source_db = self.config.get("source_db")
+        source_db_val = self.config.get("source_db")
+        if isinstance(source_db_val, list):
+            self.source_dbs = [str(db) for db in source_db_val]
+        elif isinstance(source_db_val, str):
+            self.source_dbs = [source_db_val]
+        else:
+            self.source_dbs = []
+        self.source_db = self.source_dbs[0] if self.source_dbs else None
+
         self.target_db = self.config.get("target_db")
         
         streaming_config = self.config.get("streaming", {})
@@ -164,7 +172,7 @@ class MigrationTemplate:
     def _validate_root_fields(self) -> None:
         if not self.name:
             raise ValidationError("Template is missing required 'name' field.")
-        if not self.source_db:
+        if not self.source_dbs:
             raise ValidationError("Template is missing required 'source_db' reference.")
         if not self.target_db:
             raise ValidationError("Template is missing required 'target_db' reference.")
