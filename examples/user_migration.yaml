@@ -1,0 +1,80 @@
+name: "migrate_users_oracle_to_postgres"
+description: "Streams and transforms users table from Oracle source to PostgreSQL target with full transactional rollback."
+
+# Database configuration mappings (keys matching db_config.yaml)
+source_db: "oracle_source"
+target_db: "postgres_target"
+
+# Streaming configurations to optimize memory footprint
+streaming:
+  chunk_size: 1000
+  itersize: 1000
+
+# Pre-migration checklist (must pass or migration aborts)
+pre_migration:
+  - name: "Check Oracle source users table exists"
+    type: "sql_exists"
+    database: "source"
+    query: "SELECT 1 FROM all_tables WHERE table_name = 'USERS'"
+
+  - name: "Check Postgres target users table exists"
+    type: "sql_exists"
+    database: "target"
+    query: "SELECT 1 FROM information_schema.tables WHERE table_name = 'users'"
+
+  - name: "Ensure Postgres target users table is clean (0 records)"
+    type: "sql_count"
+    database: "target"
+    query: "SELECT COUNT(*) FROM users"
+    expected: 0
+
+# Core data mapping configuration
+mapping:
+  source_query: "SELECT USER_ID, FIRST_NAME, LAST_NAME, EMAIL_ADDR, USER_STATUS, CREATION_DATE FROM USERS"
+  target_table: "users"
+  rollback_strategy: "transaction"
+
+  columns:
+    - source: "USER_ID"
+      target: "id"
+      type: "integer"
+
+    # Row expression mapping (combines columns using 'row')
+    - source: "FIRST_NAME"
+      target: "full_name"
+      transform: "row.get('FIRST_NAME', '') + ' ' + row.get('LAST_NAME', '')"
+      type: "string"
+
+    # Direct value transformation
+    - source: "EMAIL_ADDR"
+      target: "email"
+      transform: "lower(value).strip()"
+      type: "string"
+
+    # Value lookup mapping translating codes into values with default value fallback
+    - source: "USER_STATUS"
+      target: "status"
+      mapping_lookup:
+        "A": "active"
+        "I": "inactive"
+        "S": "suspended"
+      transform: "mapping.get(value, 'unknown')"
+      type: "string"
+
+    # Type coercion and timestamp conversion
+    - source: "CREATION_DATE"
+      target: "created_at"
+      type: "timestamp"
+
+# Post-migration checklist (must pass or migration rolls back!)
+post_migration:
+  - name: "Verify source and target row counts match"
+    type: "row_count_match"
+    source_query: "SELECT COUNT(*) FROM USERS"
+    target_query: "SELECT COUNT(*) FROM users"
+
+  - name: "Verify no active users are migrated with null emails"
+    type: "sql_count"
+    database: "target"
+    query: "SELECT COUNT(*) FROM users WHERE email IS NULL AND status = 'active'"
+    expected: 0

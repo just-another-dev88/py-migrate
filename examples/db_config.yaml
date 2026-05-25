@@ -1,0 +1,14 @@
+databases:
+  oracle_source:
+    type: "oracle"
+    user: "system"
+    password: "oraclepassword"
+    dsn: "localhost:1521/FREEPDB1" # Oracle standard Thin DSN structure
+  
+  postgres_target:
+    type: "postgres"
+    user: "postgres"
+    password: "postgrespassword"
+    host: "localhost"
+    port: 5432
+    database: "postgres"
