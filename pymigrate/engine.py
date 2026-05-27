@@ -19,6 +19,7 @@ class MigrationEngine:
         self.db_configs = db_configs
         self.source_dbs: List[BaseDatabaseAdapter] = []
         self.source_db: BaseDatabaseAdapter = None
+        self.target_dbs: List[BaseDatabaseAdapter] = []
         self.target_db: BaseDatabaseAdapter = None
 
     def _init_databases(self) -> None:
@@ -29,23 +30,30 @@ class MigrationEngine:
         elif self.source_dbs and self.source_db is None:
             self.source_db = self.source_dbs[0]
 
-        if self.source_dbs and self.target_db is not None:
+        if self.target_db is not None and (not self.target_dbs or self.target_dbs[0] is not self.target_db):
+            self.target_dbs = [self.target_db]
+        elif self.target_dbs and self.target_db is None:
+            self.target_db = self.target_dbs[0]
+
+        if self.source_dbs and self.target_dbs:
             logger.debug("Databases already initialized (or injected). Skipping setup.")
             return
 
         src_names = self.template.source_dbs
-        tgt_name = self.template.target_db
+        tgt_names = self.template.target_dbs
 
         for name in src_names:
             if name not in self.db_configs:
                 raise MigrationError(f"Source database configuration '{name}' not found in db_config.")
-        if tgt_name not in self.db_configs:
-            raise MigrationError(f"Target database configuration '{tgt_name}' not found in db_config.")
+        for name in tgt_names:
+            if name not in self.db_configs:
+                raise MigrationError(f"Target database configuration '{name}' not found in db_config.")
 
         try:
             self.source_dbs = [get_adapter(self.db_configs[name]) for name in src_names]
             self.source_db = self.source_dbs[0] if self.source_dbs else None
-            self.target_db = get_adapter(self.db_configs[tgt_name])
+            self.target_dbs = [get_adapter(self.db_configs[name]) for name in tgt_names]
+            self.target_db = self.target_dbs[0] if self.target_dbs else None
         except Exception as e:
             raise MigrationError(f"Failed to initialize database adapters: {e}")
 
@@ -57,11 +65,12 @@ class MigrationEngine:
                     db.close()
                 except Exception as e:
                     logger.warning(f"Error closing source database: {e}")
-        if self.target_db:
-            try:
-                self.target_db.close()
-            except Exception as e:
-                logger.warning(f"Error closing target database: {e}")
+        if self.target_dbs:
+            for db in self.target_dbs:
+                try:
+                    db.close()
+                except Exception as e:
+                    logger.warning(f"Error closing target database: {e}")
 
     def run(self) -> Dict[str, Any]:
         """Execute the full data migration workflow: pre-checks, stream + transform + batch write, post-checks, commit."""
@@ -74,7 +83,7 @@ class MigrationEngine:
         try:
             # 1. Run Pre-Migration Checklist
             logger.info("Executing Pre-Migration Checklist...")
-            runner = ChecklistRunner(self.source_dbs, self.target_db)
+            runner = ChecklistRunner(self.source_dbs, self.target_dbs)
             pre_passed, pre_results = runner.run_checklist(self.template.pre_migration)
             
             for res in pre_results:
@@ -84,8 +93,9 @@ class MigrationEngine:
                 raise MigrationError("Pre-migration checklist failed. Migration aborted.")
             
             # 2. Start Migration Transaction on Target
-            logger.info("Initiating target database transaction...")
-            self.target_db.begin_transaction()
+            logger.info("Initiating target database transactions...")
+            for tgt in self.target_dbs:
+                tgt.begin_transaction()
             
             # 3. Stream & Map & Write
             target_table = self.template.target_table
@@ -118,7 +128,8 @@ class MigrationEngine:
                     
                     # Write batch to target
                     try:
-                        self.target_db.write_batch(target_table, target_columns, rows_to_insert)
+                        for tgt in self.target_dbs:
+                            tgt.write_batch(target_table, target_columns, rows_to_insert)
                         total_rows_migrated += len(rows_to_insert)
                     except Exception as e:
                         raise MigrationError(f"Database write failed at source [{src_idx}], chunk {chunk_count}: {e}")
@@ -137,8 +148,9 @@ class MigrationEngine:
                 raise MigrationError("Post-migration checklist failed. Discarding migrated data.")
             
             # 5. Commit Transaction
-            logger.info("All checks passed. Committing transaction...")
-            self.target_db.commit()
+            logger.info("All checks passed. Committing transactions...")
+            for tgt in self.target_dbs:
+                tgt.commit()
             logger.info("Migration completed successfully!")
             
             return {
@@ -150,12 +162,13 @@ class MigrationEngine:
 
         except Exception as e:
             logger.error(f"Migration aborted due to error: {e}")
-            logger.info("Rolling back target transaction to restore database state...")
-            try:
-                if self.target_db:
-                    self.target_db.rollback()
-            except Exception as rollback_err:
-                logger.critical(f"Target rollback failed: {rollback_err}")
+            logger.info("Rolling back target transactions to restore database state...")
+            if self.target_dbs:
+                for tgt in self.target_dbs:
+                    try:
+                        tgt.rollback()
+                    except Exception as rollback_err:
+                        logger.critical(f"Target rollback failed: {rollback_err}")
             
             # Re-raise as MigrationError
             if isinstance(e, MigrationError):
@@ -173,11 +186,12 @@ class MigrationEngine:
             for idx, db in enumerate(self.source_dbs):
                 db.connect()
                 logger.info(f"Source [{idx}] connection validated.")
-            self.target_db.connect()
-            logger.info("Target connection validated successfully.")
+            for idx, db in enumerate(self.target_dbs):
+                db.connect()
+                logger.info(f"Target [{idx}] connection validated successfully.")
             
             logger.info("Running Pre-Migration Checks (Dry-run)...")
-            runner = ChecklistRunner(self.source_dbs, self.target_db)
+            runner = ChecklistRunner(self.source_dbs, self.target_dbs)
             pre_passed, pre_results = runner.run_checklist(self.template.pre_migration)
             
             return {
