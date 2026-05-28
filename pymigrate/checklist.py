@@ -22,14 +22,20 @@ class CheckResult:
 class ChecklistRunner:
     """Executes pre-migration and post-migration assertions against database adapters."""
 
-    def __init__(self, source_dbs: Any, target_db: BaseDatabaseAdapter):
+    def __init__(self, source_dbs: Any, target_dbs: Any):
         if isinstance(source_dbs, list):
             self.source_dbs = source_dbs
         else:
             self.source_dbs = [source_dbs]
         # Keep a self.source_db pointing to the first source for backward compatibility
         self.source_db = self.source_dbs[0] if self.source_dbs else None
-        self.target_db = target_db
+
+        if isinstance(target_dbs, list):
+            self.target_dbs = target_dbs
+        else:
+            self.target_dbs = [target_dbs] if target_dbs else []
+        # Keep a self.target_db pointing to the first target for backward compatibility
+        self.target_db = self.target_dbs[0] if self.target_dbs else None
 
     def _get_db(self, db_ref: str) -> BaseDatabaseAdapter:
         if not db_ref:
@@ -103,6 +109,26 @@ class ChecklistRunner:
                 else:
                     message = f"SQL existence check failed on: {', '.join(failures)}"
             return CheckResult(name, "sql_exists", passed, message)
+        elif db_ref and db_ref.lower() == "target":
+            failures = []
+            for idx, db in enumerate(self.target_dbs):
+                try:
+                    results = db.fetch_all(query)
+                    if len(results) == 0:
+                        failures.append(f"target[{idx}] (0 rows)")
+                except Exception as e:
+                    failures.append(f"target[{idx}] failed: {e}")
+            passed = len(failures) == 0
+            if passed:
+                message = ""
+            else:
+                if len(self.target_dbs) == 1:
+                    message = "Query returned 0 rows (expected >= 1 row)."
+                    if "failed" in failures[0]:
+                        message = failures[0]
+                else:
+                    message = f"SQL existence check failed on: {', '.join(failures)}"
+            return CheckResult(name, "sql_exists", passed, message)
         else:
             db = self._get_db(db_ref)
             results = db.fetch_all(query)
@@ -132,6 +158,17 @@ class ChecklistRunner:
                     actual_val += int(val)
                 except (ValueError, TypeError):
                     return CheckResult(name, "sql_count", False, f"Returned count is not an integer on source[{idx}]: {val}")
+        elif db_ref and db_ref.lower() == "target":
+            for idx, db in enumerate(self.target_dbs):
+                results = db.fetch_all(query)
+                if not results:
+                    return CheckResult(name, "sql_count", False, f"Query returned no rows on target[{idx}].")
+                first_row = results[0]
+                val = list(first_row.values())[0]
+                try:
+                    actual_val += int(val)
+                except (ValueError, TypeError):
+                    return CheckResult(name, "sql_count", False, f"Returned count is not an integer on target[{idx}]: {val}")
         else:
             db = self._get_db(db_ref)
             results = db.fetch_all(query)
@@ -207,15 +244,26 @@ class ChecklistRunner:
                 except Exception as e:
                     return CheckResult(name, "row_count_match", False, f"Error getting count from source[{idx}]: {e}")
 
-        # Get count from target database
-        tgt_res = self.target_db.fetch_all(tgt_query)
+        # Get count from target databases and check that each matches src_count
+        failures = []
         tgt_count = 0
-        if tgt_res:
+        for idx, db in enumerate(self.target_dbs):
             try:
-                tgt_count = int(list(tgt_res[0].values())[0])
+                tgt_res = db.fetch_all(tgt_query)
+                tgt_count = 0
+                if tgt_res:
+                    tgt_count = int(list(tgt_res[0].values())[0])
+                if src_count != tgt_count:
+                    failures.append(f"target[{idx}] ({tgt_count} rows)")
             except Exception as e:
-                return CheckResult(name, "row_count_match", False, f"Error getting count from target: {e}")
+                failures.append(f"target[{idx}] failed: {e}")
 
-        passed = src_count == tgt_count
-        message = "" if passed else f"Aggregate Source rows: {src_count}, Target rows: {tgt_count}"
+        passed = len(failures) == 0
+        if passed:
+            message = ""
+        else:
+            if len(self.target_dbs) == 1:
+                message = f"Aggregate Source rows: {src_count}, Target rows: {tgt_count}"
+            else:
+                message = f"Aggregate Source rows: {src_count}, Target mismatch details: {', '.join(failures)}"
         return CheckResult(name, "row_count_match", passed, message)

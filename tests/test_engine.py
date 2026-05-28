@@ -22,7 +22,7 @@ class TrackingDatabaseAdapter(MockDatabaseAdapter):
         return len(rows)
 
 
-def get_test_template_path(pre_checks=None, post_checks=None, multi_source=False):
+def get_test_template_path(pre_checks=None, post_checks=None, multi_source=False, multi_target=False):
     pre_yaml = ""
     if pre_checks:
         pre_yaml = "pre_migration:\n" + "\n".join([f"  - name: {c['name']}\n    type: {c['type']}\n    database: {c['database']}\n    query: '{c['query']}'" for c in pre_checks])
@@ -32,11 +32,12 @@ def get_test_template_path(pre_checks=None, post_checks=None, multi_source=False
         post_yaml = "post_migration:\n" + "\n".join([f"  - name: {c['name']}\n    type: {c['type']}\n    database: {c['database']}\n    query: '{c['query']}'\n    expected: {c['expected']}" for c in post_checks])
 
     source_db_block = 'source_db:\n  - "src1"\n  - "src2"' if multi_source else 'source_db: "src"'
+    target_db_block = 'target_db:\n  - "tgt1"\n  - "tgt2"' if multi_target else 'target_db: "tgt"'
 
     yaml_content = f"""
 name: "test_migration"
 {source_db_block}
-target_db: "tgt"
+{target_db_block}
 streaming:
   chunk_size: 2
 {pre_yaml}
@@ -268,5 +269,86 @@ def test_migration_engine_multi_source_failure_rollback():
         assert tgt_db.commit_called is False
         assert tgt_db.rollback_called is True
         
+    finally:
+        os.remove(template_path)
+
+
+def test_migration_engine_multi_target_success():
+    template_path = get_test_template_path(multi_target=True)
+    try:
+        template = MigrationTemplate(template_path)
+        db_configs = {"src": {"type": "postgres"}, "tgt1": {"type": "postgres"}, "tgt2": {"type": "postgres"}}
+        
+        engine = MigrationEngine(template, db_configs)
+        engine._init_databases()
+        
+        src_db = TrackingDatabaseAdapter()
+        tgt_db1 = TrackingDatabaseAdapter()
+        tgt_db2 = TrackingDatabaseAdapter()
+        
+        engine.source_db = src_db
+        engine.source_dbs = [src_db]
+        engine.target_dbs = [tgt_db1, tgt_db2]
+        engine.target_db = tgt_db1
+
+        src_db.stream_data = [
+            [{"ID": 1, "NAME": "ALICE"}, {"ID": 2, "NAME": "BOB"}]
+        ]
+        
+        res = engine.run()
+        
+        assert res["success"] is True
+        assert res["rows_migrated"] == 2
+        
+        # Both targets began and committed transactions successfully
+        for tgt_db in [tgt_db1, tgt_db2]:
+            assert tgt_db.begin_called is True
+            assert tgt_db.commit_called is True
+            assert tgt_db.rollback_called is False
+            
+            assert len(tgt_db.written_batches) == 1
+            batch = tgt_db.written_batches[0]
+            assert batch[0] == "users"
+            assert batch[1] == ["id", "name"]
+            assert batch[2] == [(1, "alice"), (2, "bob")]
+            
+    finally:
+        os.remove(template_path)
+
+
+def test_migration_engine_multi_target_failure_rollback():
+    template_path = get_test_template_path(multi_target=True)
+    try:
+        template = MigrationTemplate(template_path)
+        db_configs = {"src": {"type": "postgres"}, "tgt1": {"type": "postgres"}, "tgt2": {"type": "postgres"}}
+        
+        engine = MigrationEngine(template, db_configs)
+        engine._init_databases()
+        
+        src_db = TrackingDatabaseAdapter()
+        tgt_db1 = TrackingDatabaseAdapter()
+        tgt_db2 = TrackingDatabaseAdapter()
+        
+        engine.source_db = src_db
+        engine.source_dbs = [src_db]
+        engine.target_dbs = [tgt_db1, tgt_db2]
+        engine.target_db = tgt_db1
+
+        # Shard fails due to transform mapping error
+        src_db.stream_data = [
+            [{"ID": "INVALID_INT", "NAME": "ALICE"}]
+        ]
+        
+        with pytest.raises(MigrationError) as exc_info:
+            engine.run()
+            
+        assert "Transformation failed" in str(exc_info.value)
+        
+        # Both targets are rolled back
+        for tgt_db in [tgt_db1, tgt_db2]:
+            assert tgt_db.begin_called is True
+            assert tgt_db.commit_called is False
+            assert tgt_db.rollback_called is True
+            
     finally:
         os.remove(template_path)

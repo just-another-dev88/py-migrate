@@ -108,3 +108,33 @@ mapping:
         assert template.columns[1].transformer is not None
     finally:
         os.remove(temp_path)
+
+
+def test_migration_template_parser_plural_keys():
+    yaml_content = """
+name: "test_migration_plural"
+source_dbs:
+  - "src1"
+  - "src2"
+target_dbs:
+  - "tgt1"
+  - "tgt2"
+mapping:
+  source_query: "SELECT * FROM src_table"
+  target_table: "tgt_table"
+  columns:
+    - source: "ID"
+      target: "id"
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(yaml_content)
+        temp_path = f.name
+
+    try:
+        template = MigrationTemplate(temp_path)
+        assert template.source_dbs == ["src1", "src2"]
+        assert template.source_db == "src1"
+        assert template.target_dbs == ["tgt1", "tgt2"]
+        assert template.target_db == "tgt1"
+    finally:
+        os.remove(temp_path)

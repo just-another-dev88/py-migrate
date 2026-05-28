@@ -136,7 +136,7 @@ class MigrationTemplate:
         self.config = self._load_yaml(filepath)
         self.name = self.config.get("name")
         self.description = self.config.get("description", "")
-        source_db_val = self.config.get("source_db")
+        source_db_val = self.config.get("source_db") or self.config.get("source_dbs")
         if isinstance(source_db_val, list):
             self.source_dbs = [str(db) for db in source_db_val]
         elif isinstance(source_db_val, str):
@@ -145,7 +145,14 @@ class MigrationTemplate:
             self.source_dbs = []
         self.source_db = self.source_dbs[0] if self.source_dbs else None
 
-        self.target_db = self.config.get("target_db")
+        target_db_val = self.config.get("target_db") or self.config.get("target_dbs")
+        if isinstance(target_db_val, list):
+            self.target_dbs = [str(db) for db in target_db_val]
+        elif isinstance(target_db_val, str):
+            self.target_dbs = [target_db_val]
+        else:
+            self.target_dbs = []
+        self.target_db = self.target_dbs[0] if self.target_dbs else None
         
         streaming_config = self.config.get("streaming", {})
         self.chunk_size = streaming_config.get("chunk_size", 1000)
@@ -174,7 +181,7 @@ class MigrationTemplate:
             raise ValidationError("Template is missing required 'name' field.")
         if not self.source_dbs:
             raise ValidationError("Template is missing required 'source_db' reference.")
-        if not self.target_db:
+        if not self.target_dbs:
             raise ValidationError("Template is missing required 'target_db' reference.")
         if "mapping" not in self.config:
             raise ValidationError("Template is missing required 'mapping' section.")

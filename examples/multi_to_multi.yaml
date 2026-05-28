@@ -1,0 +1,46 @@
+name: "migrate_multi_to_multi"
+description: "Streams and aggregates from multiple Oracle source shards, and mirrors the results across multiple Postgres targets."
+
+source_db:
+  - "oracle_source_shard1"
+  - "oracle_source_shard2"
+
+target_db:
+  - "postgres_target_replica1"
+  - "postgres_target_replica2"
+
+streaming:
+  chunk_size: 1000
+  itersize: 1000
+
+pre_migration:
+  - name: "Check Oracle source tables exist on all shards"
+    type: "sql_exists"
+    database: "source"
+    query: "SELECT 1 FROM all_tables WHERE table_name = 'USERS'"
+
+  - name: "Check Postgres target tables exist on all replicas"
+    type: "sql_exists"
+    database: "target"
+    query: "SELECT 1 FROM information_schema.tables WHERE table_name = 'users'"
+
+mapping:
+  source_query: "SELECT USER_ID, EMAIL_ADDR FROM USERS"
+  target_table: "users"
+  rollback_strategy: "transaction"
+
+  columns:
+    - source: "USER_ID"
+      target: "id"
+      type: "integer"
+
+    - source: "EMAIL_ADDR"
+      target: "email"
+      transform: "lower(value).strip()"
+      type: "string"
+
+post_migration:
+  - name: "Verify replicated target row counts match aggregated source count"
+    type: "row_count_match"
+    source_query: "SELECT COUNT(*) FROM USERS"
+    target_query: "SELECT COUNT(*) FROM users"
