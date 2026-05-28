@@ -1,14 +1,44 @@
 databases:
+  # Oracle Sources
   oracle_source:
     type: "oracle"
     user: "system"
     password: "oraclepassword"
-    dsn: "localhost:1521/FREEPDB1" # Oracle standard Thin DSN structure
-  
+    dsn: "localhost:1521/FREEPDB1"
+
+  oracle_source_shard1:
+    type: "oracle"
+    user: "system"
+    password: "oraclepassword"
+    dsn: "localhost:1521/FREEPDB1"
+
+  oracle_source_shard2:
+    type: "oracle"
+    user: "system"
+    password: "oraclepassword"
+    dsn: "localhost:1522/FREEPDB2"
+
+  # Postgres Targets
   postgres_target:
     type: "postgres"
     user: "postgres"
     password: "postgrespassword"
     host: "localhost"
     port: 5432
-    database: "postgres"
+    database: "postgres_db"
+
+  postgres_target_replica1:
+    type: "postgres"
+    user: "postgres"
+    password: "postgrespassword"
+    host: "localhost"
+    port: 5432
+    database: "postgres_db_replica1"
+
+  postgres_target_replica2:
+    type: "postgres"
+    user: "postgres"
+    password: "postgrespassword"
+    host: "localhost"
+    port: 5433
+    database: "postgres_db_replica2"

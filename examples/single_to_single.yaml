@@ -1,0 +1,41 @@
+name: "migrate_single_to_single"
+description: "Migrates users from a single Oracle source to a single Postgres target."
+
+source_db: "oracle_source"
+target_db: "postgres_target"
+
+streaming:
+  chunk_size: 1000
+  itersize: 1000
+
+pre_migration:
+  - name: "Check source table exists"
+    type: "sql_exists"
+    database: "source"
+    query: "SELECT 1 FROM all_tables WHERE table_name = 'USERS'"
+
+  - name: "Check target table exists"
+    type: "sql_exists"
+    database: "target"
+    query: "SELECT 1 FROM information_schema.tables WHERE table_name = 'users'"
+
+mapping:
+  source_query: "SELECT USER_ID, EMAIL_ADDR FROM USERS"
+  target_table: "users"
+  rollback_strategy: "transaction"
+
+  columns:
+    - source: "USER_ID"
+      target: "id"
+      type: "integer"
+
+    - source: "EMAIL_ADDR"
+      target: "email"
+      transform: "lower(value).strip()"
+      type: "string"
+
+post_migration:
+  - name: "Verify row counts match"
+    type: "row_count_match"
+    source_query: "SELECT COUNT(*) FROM USERS"
+    target_query: "SELECT COUNT(*) FROM users"
