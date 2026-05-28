@@ -136,7 +136,7 @@ class MigrationTemplate:
         self.config = self._load_yaml(filepath)
         self.name = self.config.get("name")
         self.description = self.config.get("description", "")
-        source_db_val = self.config.get("source_db")
+        source_db_val = self.config.get("source_db") or self.config.get("source_dbs")
         if isinstance(source_db_val, list):
             self.source_dbs = [str(db) for db in source_db_val]
         elif isinstance(source_db_val, str):
@@ -145,7 +145,7 @@ class MigrationTemplate:
             self.source_dbs = []
         self.source_db = self.source_dbs[0] if self.source_dbs else None
 
-        target_db_val = self.config.get("target_db")
+        target_db_val = self.config.get("target_db") or self.config.get("target_dbs")
         if isinstance(target_db_val, list):
             self.target_dbs = [str(db) for db in target_db_val]
         elif isinstance(target_db_val, str):
