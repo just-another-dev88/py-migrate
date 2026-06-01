@@ -7,8 +7,9 @@ logger = logging.getLogger("pymigrate.database")
 class BaseDatabaseAdapter(ABC):
     """Abstract Base Class defining the contract for Database Adapters."""
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], peer_configs: Dict[str, Any] = None):
         self.config = config
+        self.peer_configs = peer_configs
         self.connection = None
 
     @abstractmethod
@@ -170,6 +171,46 @@ class PostgresAdapter(BaseDatabaseAdapter):
 class OracleAdapter(BaseDatabaseAdapter):
     """Oracle Database Adapter using oracledb in Thin mode."""
 
+    def _setup_dblinks(self, conn) -> List[str]:
+        created_dblinks = []
+        if self.peer_configs:
+            import re
+            for peer_name, peer_cfg in self.peer_configs.items():
+                if peer_cfg.get("type", "").lower() == "oracle":
+                    # Sanitize peer name for dblink
+                    sanitized_name = re.sub(r'[^a-zA-Z0-9_]', '_', peer_name)
+                    if sanitized_name and sanitized_name[0].isdigit():
+                        sanitized_name = "db_" + sanitized_name
+                    
+                    peer_user = peer_cfg.get("user")
+                    peer_pwd = peer_cfg.get("password")
+                    peer_dsn = peer_cfg.get("dsn")
+                    
+                    with conn.cursor() as cursor:
+                        try:
+                            cursor.execute(f"DROP DATABASE LINK {sanitized_name}")
+                        except Exception:
+                            pass
+                        try:
+                            cursor.execute(
+                                f"CREATE DATABASE LINK {sanitized_name} "
+                                f"CONNECT TO {peer_user} IDENTIFIED BY \"{peer_pwd}\" "
+                                f"USING '{peer_dsn}'"
+                            )
+                            created_dblinks.append(sanitized_name)
+                        except Exception as e:
+                            logger.warning(f"Failed to create DB link {sanitized_name}: {e}")
+        return created_dblinks
+
+    def _teardown_dblinks(self, conn, created_dblinks: List[str]) -> None:
+        if created_dblinks:
+            with conn.cursor() as cursor:
+                for dblink in created_dblinks:
+                    try:
+                        cursor.execute(f"DROP DATABASE LINK {dblink}")
+                    except Exception as e:
+                        logger.warning(f"Failed to drop DB link {dblink}: {e}")
+
     def connect(self) -> None:
         import oracledb
         if self.connection is None:
@@ -181,10 +222,14 @@ class OracleAdapter(BaseDatabaseAdapter):
                 dsn=self.config.get("dsn")
             )
             self.connection.autocommit = False
+            self._created_dblinks = self._setup_dblinks(self.connection)
 
     def close(self) -> None:
         if self.connection:
             logger.debug("Closing Oracle connection")
+            if hasattr(self, "_created_dblinks") and self._created_dblinks:
+                self._teardown_dblinks(self.connection, self._created_dblinks)
+                self._created_dblinks = []
             try:
                 self.connection.close()
             except Exception as e:
@@ -216,6 +261,7 @@ class OracleAdapter(BaseDatabaseAdapter):
         
         # Oracle thin connection for streaming to prevent mixing transaction states
         stream_conn = None
+        stream_dblinks = []
         try:
             import oracledb
             stream_conn = oracledb.connect(
@@ -224,6 +270,7 @@ class OracleAdapter(BaseDatabaseAdapter):
                 dsn=self.config.get("dsn")
             )
             stream_conn.autocommit = False
+            stream_dblinks = self._setup_dblinks(stream_conn)
             
             with stream_conn.cursor() as cursor:
                 cursor.arraysize = chunk_size
@@ -249,6 +296,11 @@ class OracleAdapter(BaseDatabaseAdapter):
             raise e
         finally:
             if stream_conn:
+                if stream_dblinks:
+                    try:
+                        self._teardown_dblinks(stream_conn, stream_dblinks)
+                    except Exception:
+                        pass
                 try:
                     stream_conn.close()
                 except Exception:
@@ -285,12 +337,12 @@ class OracleAdapter(BaseDatabaseAdapter):
             self.connection.rollback()
 
 
-def get_adapter(db_config: Dict[str, Any]) -> BaseDatabaseAdapter:
+def get_adapter(db_config: Dict[str, Any], peer_configs: Dict[str, Any] = None) -> BaseDatabaseAdapter:
     """Factory to get the appropriate Database Adapter based on type."""
     db_type = db_config.get("type", "").lower()
     if db_type == "postgres" or db_type == "postgresql":
-        return PostgresAdapter(db_config)
+        return PostgresAdapter(db_config, peer_configs=peer_configs)
     elif db_type == "oracle":
-        return OracleAdapter(db_config)
+        return OracleAdapter(db_config, peer_configs=peer_configs)
     else:
         raise ValueError(f"Unsupported database type: {db_type}. Supported types are: 'oracle', 'postgres'")

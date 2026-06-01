@@ -50,9 +50,16 @@ class MigrationEngine:
                 raise MigrationError(f"Target database configuration '{name}' not found in db_config.")
 
         try:
-            self.source_dbs = [get_adapter(self.db_configs[name]) for name in src_names]
+            self.source_dbs = []
+            for name in src_names:
+                peers = {k: v for k, v in self.db_configs.items() if k != name}
+                self.source_dbs.append(get_adapter(self.db_configs[name], peer_configs=peers))
             self.source_db = self.source_dbs[0] if self.source_dbs else None
-            self.target_dbs = [get_adapter(self.db_configs[name]) for name in tgt_names]
+
+            self.target_dbs = []
+            for name in tgt_names:
+                peers = {k: v for k, v in self.db_configs.items() if k != name}
+                self.target_dbs.append(get_adapter(self.db_configs[name], peer_configs=peers))
             self.target_db = self.target_dbs[0] if self.target_dbs else None
         except Exception as e:
             raise MigrationError(f"Failed to initialize database adapters: {e}")
